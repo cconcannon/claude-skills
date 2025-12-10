@@ -137,6 +137,53 @@ async def test_login_feature(runner):
 - [API Reference](references/api_reference.md) - Full API documentation
 - [Test Patterns](references/test_patterns.md) - Common testing scenarios
 
+## Error Handling
+
+The runner provides robust error detection and captures screenshots on failures:
+
+```python
+# Navigate returns result dict with error info
+nav_result = await runner.navigate("http://localhost:3000")
+if not nav_result["success"]:
+    print(f"Error: {nav_result['error']}")  # e.g., "Connection refused"
+    print(f"Type: {nav_result['error_type']}")  # e.g., "connection_refused"
+    # Screenshot auto-captured as ERROR_navigation_error.png
+
+# Check for page diagnostics (console errors, failed requests)
+if runner.has_errors():
+    diagnostics = runner.get_diagnostics()
+    print(diagnostics["console_errors"])     # JS errors
+    print(diagnostics["failed_requests"])    # Failed network requests
+    print(diagnostics["response_errors"])    # HTTP 4xx/5xx responses
+
+# Use safe_action for wrapped error handling
+result = await runner.safe_action(
+    "click_submit",
+    runner.click("role:button[name=Submit]")
+)
+if not result["success"]:
+    print(f"Failed: {result['error']}")
+```
+
+### Error Types Detected Early
+
+| Error Type | Detection | Screenshot |
+|------------|-----------|------------|
+| `connection_refused` | Server not running | Yes |
+| `dns_error` | Invalid hostname | Yes |
+| `ssl_error` | Certificate issues | Yes |
+| `timeout` | Page/element not loading | Yes |
+| `connection_timeout` | Server not responding | Yes |
+| HTTP 4xx/5xx | Response status codes | Yes |
+
+### Diagnostics Monitoring
+
+The runner automatically monitors:
+- **Console errors/warnings** - JavaScript exceptions and warnings
+- **Failed network requests** - Resources that failed to load
+- **HTTP error responses** - 4xx and 5xx status codes
+- **Page errors** - Unhandled exceptions
+
 ## Key Principles
 
 1. **Use role selectors** - Most resilient to UI changes
@@ -144,3 +191,4 @@ async def test_login_feature(runner):
 3. **Screenshot key moments** - Before/after important actions
 4. **Test user behavior** - Not implementation details
 5. **Cleanup on success** - Remove temp files after verification
+6. **Check navigation results** - Always verify `nav_result["success"]`

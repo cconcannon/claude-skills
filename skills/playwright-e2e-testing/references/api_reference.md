@@ -47,7 +47,20 @@ role:listitem                      # List items
 
 ### Navigation
 ```python
-await runner.navigate("https://example.com")  # Wait for networkidle
+# Basic navigation (returns result dict)
+nav_result = await runner.navigate("https://example.com")
+
+# Check if navigation succeeded
+if not nav_result["success"]:
+    print(nav_result["error"])       # Human-readable error
+    print(nav_result["error_type"])  # e.g., "connection_refused", "timeout"
+    print(nav_result["diagnostics"]) # Console errors, failed requests
+
+# With custom wait strategy
+nav_result = await runner.navigate(
+    "https://example.com",
+    wait_until="domcontentloaded"  # "load", "domcontentloaded", "networkidle"
+)
 ```
 
 ### Click
@@ -180,6 +193,78 @@ runner = E2ETestRunner(
 ### Headless vs Headed
 - **Headless** (`headless=True`): Faster, no GUI, ideal for CI
 - **Headed** (`headless=False`): Visual debugging, see browser actions
+
+---
+
+## Error Handling & Diagnostics
+
+### Navigation Errors
+The `navigate()` method returns a result dict instead of throwing on common errors:
+
+```python
+nav_result = await runner.navigate("http://localhost:3000")
+
+# Result structure:
+{
+    "success": True/False,
+    "url": "http://localhost:3000",
+    "error": "Connection refused: Server not running...",  # if failed
+    "error_type": "connection_refused",  # categorized error type
+    "status_code": 404,  # for HTTP errors
+    "diagnostics": {...}  # console errors, failed requests
+}
+```
+
+### Error Types
+| Type | Description |
+|------|-------------|
+| `connection_refused` | Server not running or rejecting connections |
+| `dns_error` | Could not resolve hostname |
+| `ssl_error` | SSL/TLS certificate problem |
+| `timeout` | Page did not load in time |
+| `connection_timeout` | Server did not respond |
+| `no_internet` | No network connection |
+| `navigation_error` | Other navigation failures |
+
+### Diagnostics API
+```python
+# Check for collected errors
+if runner.has_errors():
+    diagnostics = runner.get_diagnostics()
+
+# Diagnostics structure:
+{
+    "console_errors": [{"type": "error", "text": "...", "location": "..."}],
+    "failed_requests": [{"url": "...", "method": "GET", "failure": "..."}],
+    "response_errors": [{"url": "...", "status": 404, "status_text": "Not Found"}],
+    "page_errors": ["Uncaught TypeError: ..."]
+}
+
+# Clear diagnostics before a new test phase
+runner.clear_diagnostics()
+```
+
+### Safe Action Wrapper
+Wrap any action with error handling and automatic screenshot on failure:
+
+```python
+result = await runner.safe_action(
+    "click_submit",
+    runner.click("role:button[name=Submit]")
+)
+if not result["success"]:
+    print(result["error"])       # Error message
+    print(result["error_type"])  # "timeout", "playwright_error", etc.
+    # Screenshot auto-captured as click_submit_error.png
+```
+
+### Automatic Screenshot on Errors
+Screenshots are automatically captured for:
+- Navigation timeouts → `ERROR_navigation_timeout.png`
+- Navigation errors → `ERROR_navigation_error.png`
+- Action timeouts → `TIMEOUT_{step_name}.png`
+- Action errors → `ERROR_{step_name}.png`
+- General failures → `FAILURE_{step_name}.png`
 
 ---
 

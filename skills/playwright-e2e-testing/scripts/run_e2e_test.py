@@ -15,7 +15,51 @@ import sys
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
-from playwright.async_api import async_playwright, Page, Browser, BrowserContext
+from dataclasses import dataclass, field
+from playwright.async_api import (
+    async_playwright,
+    Page,
+    Browser,
+    BrowserContext,
+    Response,
+    Error as PlaywrightError,
+    TimeoutError as PlaywrightTimeoutError,
+)
+
+
+@dataclass
+class PageDiagnostics:
+    """Collects page errors and failed requests for early error detection."""
+
+    console_errors: list[dict] = field(default_factory=list)
+    failed_requests: list[dict] = field(default_factory=list)
+    response_errors: list[dict] = field(default_factory=list)
+    page_errors: list[str] = field(default_factory=list)
+
+    def has_errors(self) -> bool:
+        """Check if any errors have been collected."""
+        return bool(
+            self.console_errors
+            or self.failed_requests
+            or self.response_errors
+            or self.page_errors
+        )
+
+    def get_summary(self) -> dict:
+        """Get a summary of all collected errors."""
+        return {
+            "console_errors": self.console_errors,
+            "failed_requests": self.failed_requests,
+            "response_errors": self.response_errors,
+            "page_errors": self.page_errors,
+        }
+
+    def clear(self) -> None:
+        """Clear all collected errors."""
+        self.console_errors.clear()
+        self.failed_requests.clear()
+        self.response_errors.clear()
+        self.page_errors.clear()
 
 
 class E2ETestRunner:
@@ -39,11 +83,13 @@ class E2ETestRunner:
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
+        self.diagnostics = PageDiagnostics()
+        self._playwright = None
         
     async def setup(self) -> None:
-        """Initialize browser and page."""
+        """Initialize browser and page with error monitoring."""
         self.screenshot_dir.mkdir(parents=True, exist_ok=True)
-        playwright = await async_playwright().start()
+        self._playwright = await async_playwright().start()
 
         # Build launch args based on mode
         if self.headless:
@@ -55,18 +101,66 @@ class E2ETestRunner:
             launch_args = []
 
         # Launch Chrome (chromium channel for real Chrome, or bundled chromium)
-        self.browser = await playwright.chromium.launch(
+        self.browser = await self._playwright.chromium.launch(
             headless=self.headless,
             channel="chrome" if not self.headless else None,
             args=launch_args,
         )
-        
+
         self.context = await self.browser.new_context(
             viewport=self.viewport,
             locale="en-US",
         )
         self.context.set_default_timeout(self.timeout)
         self.page = await self.context.new_page()
+
+        # Attach error monitoring listeners
+        self._attach_error_listeners()
+
+    def _attach_error_listeners(self) -> None:
+        """Attach event listeners to monitor page errors and failed requests."""
+        # Console errors (JS errors, warnings, etc.)
+        self.page.on("console", self._on_console_message)
+
+        # Page crashes and unhandled exceptions
+        self.page.on("pageerror", self._on_page_error)
+
+        # Failed network requests
+        self.page.on("requestfailed", self._on_request_failed)
+
+        # Track response status codes
+        self.page.on("response", self._on_response)
+
+    def _on_console_message(self, msg) -> None:
+        """Capture console errors and warnings."""
+        if msg.type in ("error", "warning"):
+            self.diagnostics.console_errors.append({
+                "type": msg.type,
+                "text": msg.text,
+                "location": str(msg.location) if msg.location else None,
+            })
+
+    def _on_page_error(self, error) -> None:
+        """Capture unhandled page errors (JS exceptions)."""
+        self.diagnostics.page_errors.append(str(error))
+
+    def _on_request_failed(self, request) -> None:
+        """Capture failed network requests."""
+        self.diagnostics.failed_requests.append({
+            "url": request.url,
+            "method": request.method,
+            "failure": request.failure,
+            "resource_type": request.resource_type,
+        })
+
+    def _on_response(self, response: Response) -> None:
+        """Track HTTP error responses (4xx, 5xx)."""
+        if response.status >= 400:
+            self.diagnostics.response_errors.append({
+                "url": response.url,
+                "status": response.status,
+                "status_text": response.status_text,
+            })
         
     async def teardown(self) -> None:
         """Clean up browser resources."""
@@ -76,10 +170,90 @@ class E2ETestRunner:
             await self.context.close()
         if self.browser:
             await self.browser.close()
-            
-    async def navigate(self, url: str) -> None:
-        """Navigate to URL and wait for load."""
-        await self.page.goto(url, wait_until="networkidle")
+        if self._playwright:
+            await self._playwright.stop()
+
+    async def navigate(
+        self,
+        url: str,
+        wait_until: str = "networkidle",
+        capture_on_error: bool = True,
+    ) -> dict:
+        """
+        Navigate to URL with robust error handling.
+
+        Args:
+            url: Target URL to navigate to
+            wait_until: Wait strategy - 'load', 'domcontentloaded', 'networkidle'
+            capture_on_error: Capture screenshot if navigation fails
+
+        Returns:
+            dict with success status and any error/diagnostic info
+        """
+        self.diagnostics.clear()  # Clear previous diagnostics
+        result = {"success": True, "url": url, "error": None, "diagnostics": None}
+
+        try:
+            response = await self.page.goto(url, wait_until=wait_until)
+
+            # Check response status
+            if response is None:
+                result["success"] = False
+                result["error"] = "No response received (page may have been redirected or blocked)"
+            elif response.status >= 400:
+                result["success"] = False
+                result["error"] = f"HTTP {response.status}: {response.status_text}"
+                result["status_code"] = response.status
+
+            # Include any collected diagnostics
+            if self.diagnostics.has_errors():
+                result["diagnostics"] = self.diagnostics.get_summary()
+
+        except PlaywrightTimeoutError as e:
+            result["success"] = False
+            result["error"] = f"Timeout: Page did not load within {self.timeout}ms"
+            result["error_type"] = "timeout"
+            result["diagnostics"] = self.diagnostics.get_summary()
+            if capture_on_error:
+                await self._capture_error_screenshot("navigation_timeout")
+
+        except PlaywrightError as e:
+            result["success"] = False
+            error_msg = str(e)
+
+            # Provide user-friendly error messages for common issues
+            if "net::ERR_CONNECTION_REFUSED" in error_msg:
+                result["error"] = f"Connection refused: Server at {url} is not running or not accepting connections"
+                result["error_type"] = "connection_refused"
+            elif "net::ERR_NAME_NOT_RESOLVED" in error_msg:
+                result["error"] = f"DNS resolution failed: Could not resolve hostname in {url}"
+                result["error_type"] = "dns_error"
+            elif "net::ERR_SSL" in error_msg or "SSL" in error_msg.upper():
+                result["error"] = f"SSL/TLS error: Certificate issue with {url}"
+                result["error_type"] = "ssl_error"
+            elif "net::ERR_CONNECTION_TIMED_OUT" in error_msg:
+                result["error"] = f"Connection timed out: Server at {url} did not respond"
+                result["error_type"] = "connection_timeout"
+            elif "net::ERR_INTERNET_DISCONNECTED" in error_msg:
+                result["error"] = "No internet connection"
+                result["error_type"] = "no_internet"
+            else:
+                result["error"] = f"Navigation error: {error_msg}"
+                result["error_type"] = "navigation_error"
+
+            result["diagnostics"] = self.diagnostics.get_summary()
+            if capture_on_error:
+                await self._capture_error_screenshot("navigation_error")
+
+        return result
+
+    async def _capture_error_screenshot(self, name: str) -> Optional[Path]:
+        """Attempt to capture a screenshot during an error state."""
+        try:
+            return await self.screenshot(f"ERROR_{name}")
+        except Exception:
+            # Page may be in unrecoverable state, screenshot not possible
+            return None
         
     async def click(self, selector: str, **kwargs) -> None:
         """Click an element using various selector strategies."""
@@ -214,13 +388,69 @@ class E2ETestRunner:
             except OSError:
                 pass
         self.screenshots.clear()
-        
+
         # Try to remove directory if empty
         try:
             self.screenshot_dir.rmdir()
         except OSError:
             pass
-            
+
+    def get_diagnostics(self) -> dict:
+        """Get current page diagnostics (console errors, failed requests, etc.)."""
+        return self.diagnostics.get_summary()
+
+    def has_errors(self) -> bool:
+        """Check if any errors have been collected during page interactions."""
+        return self.diagnostics.has_errors()
+
+    def clear_diagnostics(self) -> None:
+        """Clear collected diagnostics."""
+        self.diagnostics.clear()
+
+    async def safe_action(
+        self,
+        action_name: str,
+        action_coro,
+        capture_on_error: bool = True,
+    ) -> dict:
+        """
+        Execute an action with error handling and optional screenshot capture.
+
+        Args:
+            action_name: Name of the action for error reporting
+            action_coro: Coroutine to execute
+            capture_on_error: Whether to capture screenshot on failure
+
+        Returns:
+            dict with success status and error info if failed
+        """
+        result = {"success": True, "action": action_name, "error": None}
+
+        try:
+            await action_coro
+        except PlaywrightTimeoutError as e:
+            result["success"] = False
+            result["error"] = f"Timeout waiting for {action_name}"
+            result["error_type"] = "timeout"
+            result["diagnostics"] = self.diagnostics.get_summary()
+            if capture_on_error:
+                await self._capture_error_screenshot(f"{action_name}_timeout")
+        except PlaywrightError as e:
+            result["success"] = False
+            result["error"] = str(e)
+            result["error_type"] = "playwright_error"
+            result["diagnostics"] = self.diagnostics.get_summary()
+            if capture_on_error:
+                await self._capture_error_screenshot(f"{action_name}_error")
+        except Exception as e:
+            result["success"] = False
+            result["error"] = str(e)
+            result["error_type"] = "unknown_error"
+            if capture_on_error:
+                await self._capture_error_screenshot(f"{action_name}_error")
+
+        return result
+
     def _get_locator(self, selector: str):
         """
         Get locator from selector string.
@@ -273,25 +503,50 @@ class E2ETestRunner:
 
 async def run_test_steps(runner: E2ETestRunner, steps: list[dict]) -> dict:
     """
-    Execute a sequence of test steps.
-    
+    Execute a sequence of test steps with robust error handling.
+
     Args:
         runner: E2ETestRunner instance
         steps: List of step dictionaries with action and params
-        
+
     Returns:
-        Results dict with success status and any captured data
+        Results dict with success status, steps executed, and any error/diagnostic info
     """
-    results = {"success": True, "steps": [], "error": None}
-    
+    results = {"success": True, "steps": [], "error": None, "diagnostics": None}
+
     for i, step in enumerate(steps):
         action = step.get("action")
         params = step.get("params", {})
         step_name = step.get("name", f"Step {i + 1}")
-        
+
         try:
             if action == "navigate":
-                await runner.navigate(params["url"])
+                # Navigate returns a result dict with success/error info
+                nav_result = await runner.navigate(
+                    params["url"],
+                    wait_until=params.get("wait_until", "networkidle"),
+                )
+                if not nav_result["success"]:
+                    results["success"] = False
+                    results["error"] = f"{step_name}: {nav_result['error']}"
+                    results["error_type"] = nav_result.get("error_type")
+                    results["diagnostics"] = nav_result.get("diagnostics")
+                    results["steps"].append({
+                        "name": step_name,
+                        "action": action,
+                        "success": False,
+                        "error": nav_result["error"],
+                        "error_type": nav_result.get("error_type"),
+                    })
+                    break
+                results["steps"].append({
+                    "name": step_name,
+                    "action": action,
+                    "success": True,
+                    "diagnostics": nav_result.get("diagnostics"),
+                })
+                continue
+
             elif action == "click":
                 await runner.click(params["selector"], **params.get("options", {}))
             elif action == "fill":
@@ -326,22 +581,67 @@ async def run_test_steps(runner: E2ETestRunner, steps: list[dict]) -> dict:
                 await asyncio.sleep(params.get("seconds", 1))
             else:
                 raise ValueError(f"Unknown action: {action}")
-                
+
             results["steps"].append({"name": step_name, "action": action, "success": True})
-            
+
+        except PlaywrightTimeoutError as e:
+            results["success"] = False
+            results["error"] = f"{step_name}: Timeout - element not found or page did not respond"
+            results["error_type"] = "timeout"
+            results["diagnostics"] = runner.get_diagnostics()
+            results["steps"].append({
+                "name": step_name,
+                "action": action,
+                "success": False,
+                "error": str(e),
+                "error_type": "timeout",
+            })
+            # Capture screenshot on timeout
+            try:
+                await runner.screenshot(f"TIMEOUT_{step_name}")
+            except Exception:
+                pass  # Page may be unresponsive
+            break
+
+        except PlaywrightError as e:
+            results["success"] = False
+            results["error"] = f"{step_name}: {str(e)}"
+            results["error_type"] = "playwright_error"
+            results["diagnostics"] = runner.get_diagnostics()
+            results["steps"].append({
+                "name": step_name,
+                "action": action,
+                "success": False,
+                "error": str(e),
+                "error_type": "playwright_error",
+            })
+            try:
+                await runner.screenshot(f"ERROR_{step_name}")
+            except Exception:
+                pass
+            break
+
         except Exception as e:
             results["success"] = False
             results["error"] = f"{step_name}: {str(e)}"
+            results["error_type"] = "unknown_error"
+            results["diagnostics"] = runner.get_diagnostics()
             results["steps"].append({
                 "name": step_name,
                 "action": action,
                 "success": False,
                 "error": str(e),
             })
-            # Take failure screenshot
-            await runner.screenshot(f"FAILURE_{step_name}")
+            try:
+                await runner.screenshot(f"FAILURE_{step_name}")
+            except Exception:
+                pass
             break
-            
+
+    # Include final diagnostics if there are any collected errors
+    if runner.has_errors() and results["diagnostics"] is None:
+        results["diagnostics"] = runner.get_diagnostics()
+
     return results
 
 
@@ -369,28 +669,44 @@ async def main():
     
     try:
         await runner.setup()
-        
+
         # If steps file provided, run those steps
         if args.steps:
             with open(args.steps) as f:
                 steps = json.load(f)
             results = await run_test_steps(runner, steps)
         else:
-            # Simple navigation and screenshot
-            await runner.navigate(args.url)
-            await runner.screenshot("initial_page")
-            results = {"success": True, "message": "Page loaded successfully"}
-            
+            # Simple navigation and screenshot with error handling
+            nav_result = await runner.navigate(args.url)
+            if nav_result["success"]:
+                await runner.screenshot("initial_page")
+                results = {
+                    "success": True,
+                    "message": "Page loaded successfully",
+                    "diagnostics": nav_result.get("diagnostics"),
+                }
+            else:
+                results = {
+                    "success": False,
+                    "error": nav_result["error"],
+                    "error_type": nav_result.get("error_type"),
+                    "diagnostics": nav_result.get("diagnostics"),
+                }
+
         # Output results as JSON
         print(json.dumps(results, indent=2))
-        
+
         # Get screenshots for analysis
         screenshots = runner.get_screenshots_for_analysis()
         if screenshots:
             print(f"\nCaptured {len(screenshots)} screenshot(s) for analysis.")
             for s in screenshots:
                 print(f"  - {s['name']}: {s['path']}")
-                
+
+        # Exit with error code if failed
+        if not results.get("success", True):
+            sys.exit(1)
+
     finally:
         await runner.teardown()
 
